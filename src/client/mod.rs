@@ -11,12 +11,11 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 use crate::{
-    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, WriterConfig,
+    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, ServiceStatusSnapshot, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
-static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
-    Lazy::new(|| Arc::new(RwLock::new(None)));
+static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> = Lazy::new(|| Arc::new(RwLock::new(None)));
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 
@@ -90,6 +89,17 @@ pub async fn get_version() -> Result<Response<String>> {
         .send()
         .await?
         .json::<Response<String>>()?;
+    Ok(response)
+}
+
+pub async fn get_status() -> Result<Response<ServiceStatusSnapshot>> {
+    let client = connect().await?;
+    let response = client
+        .get(IpcCommand::Status.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<ServiceStatusSnapshot>>()?;
     Ok(response)
 }
 
