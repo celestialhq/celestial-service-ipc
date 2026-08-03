@@ -3,22 +3,22 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.github.pius-pp.celestial-service.service</string>
+    <string>{service_id}</string>
 
     <key>AssociatedBundleIdentifiers</key>
     <array>
-        <string>io.github.pius-pp.celestial-service</string>
+        <string>{app_bundle_id}</string>
     </array>
 
     <key>MachServices</key>
     <dict>
-        <key>io.github.pius-pp.celestial-service.service</key>
+        <key>{service_id}</key>
         <true/>
     </dict>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/PrivilegedHelperTools/io.github.pius-pp.celestial-service.service.bundle/Contents/MacOS/celestial-service</string>
+        <string>{service_binary}</string>
     </array>
 
     <key>GroupName</key>

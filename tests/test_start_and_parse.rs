@@ -1,8 +1,12 @@
 #![cfg(feature = "standalone")]
+
+mod common;
+
 #[cfg(test)]
 mod tests {
     use celestial_service_ipc::{
-        IPC_AUTH_EXPECT, IpcCommand, VERSION, connect, get_version, run_ipc_server, stop_ipc_server,
+        PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, connect, get_status, get_version,
+        run_ipc_server, stop_ipc_server,
     };
     use serial_test::serial;
     use tokio::task::JoinHandle;
@@ -55,40 +59,43 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_start_and_parse() {
+        crate::common::init_tracing_for_tests();
         let _ = stop_ipc_server().await;
 
-        let mut server_handle = run_ipc_server().await.expect("Starting IPC server should return Ok");
+        let mut server_handle = run_ipc_server()
+            .await
+            .expect("Starting IPC server should return Ok");
 
         server_handle = wait_for_ipc_ready(server_handle).await;
 
         let client = connect().await;
-        assert!(client.is_ok(), "Should be able to connect to IPC server after starting");
+        assert!(
+            client.is_ok(),
+            "Should be able to connect to IPC server after starting"
+        );
 
         let version = get_version().await;
-        assert!(version.is_ok(), "Should receive a response from GetVersion command");
+        assert!(
+            version.is_ok(),
+            "Should receive a response from GetVersion command"
+        );
 
         let version_data = version.unwrap().data;
         assert!(version_data.is_some(), "Version data should not be None");
 
         let version = version_data.unwrap();
+        assert_eq!(version.build_version, VERSION);
+        assert_eq!(version.protocol.epoch, PROTOCOL_EPOCH);
+        assert_eq!(version.protocol.revision, PROTOCOL_REVISION);
+
+        let status = get_status(&crate::common::owner_credentials()).await;
         assert!(
-            version == VERSION,
-            "Version data should match expected VERSION constant"
+            status.is_ok(),
+            "Should receive a response from Status command"
         );
-
-        let mock_version = "mock_version_1.0.0";
-        assert!(mock_version != version, "Version should not match mock version");
-
-        let status = client
-            .unwrap()
-            .get(IpcCommand::Status.as_ref())
-            .header("X-IPC-Magic", IPC_AUTH_EXPECT)
-            .send()
-            .await;
-        assert!(status.is_ok(), "Should receive a response from Status command");
 
         stop_ipc_server().await.unwrap();
         let res = server_handle.await.unwrap();

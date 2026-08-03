@@ -1,20 +1,24 @@
-//! Celestial Service - Cross-platform IPC service daemon
+//! Clash Verge Service - Cross-platform IPC service daemon
 //!
 //! This service can run as a standalone process or as a Windows service.
 //! It listens for shutdown signals (Ctrl+C, SIGTERM, or service stop) to gracefully terminate.
 
 use anyhow::Result;
 use celestial_service_ipc::{
-    acquire_service_owner, reconcile_service_startup, restore_desired_state, run_ipc_supervisor_until_shutdown,
+    acquire_service_owner, reconcile_service_startup, restore_desired_state,
+    run_ipc_supervisor_until_shutdown,
 };
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[cfg(windows)]
 use {
     platform_lib::{
         define_windows_service,
-        service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
     },
@@ -28,8 +32,16 @@ use {
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    set_secure_process_umask();
     init_logger();
     run_standalone().await
+}
+
+#[cfg(unix)]
+fn set_secure_process_umask() {
+    unsafe {
+        platform_lib::umask(0o077);
+    }
 }
 
 /// Main entry point for Windows.
@@ -37,7 +49,12 @@ async fn main() -> Result<()> {
 #[cfg(windows)]
 fn main() -> Result<()> {
     init_logger();
-    if service_dispatcher::start("celestial_service", ffi_service_main).is_err() {
+    if service_dispatcher::start(
+        celestial_service_ipc::WINDOWS_SERVICE_NAME,
+        ffi_service_main,
+    )
+    .is_err()
+    {
         info!("Not running as a service, starting in standalone mode.");
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(run_standalone())?;
@@ -74,7 +91,10 @@ fn run_service() -> platform_lib::Result<()> {
         }
     };
 
-    let status_handle = service_control_handler::register("celestial_service", event_handler)?;
+    let status_handle = service_control_handler::register(
+        celestial_service_ipc::WINDOWS_SERVICE_NAME,
+        event_handler,
+    )?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -100,13 +120,19 @@ fn run_service() -> platform_lib::Result<()> {
             }
         };
 
-        if let Err(error) = reconcile_service_startup().await {
-            tracing::warn!("Service startup reconciliation failed: {}", error);
-            return true;
-        }
-        if let Err(error) = restore_desired_state().await {
-            tracing::warn!("Desired state restoration failed: {}", error);
-            return true;
+        match reconcile_service_startup().await {
+            Ok(()) => {
+                if let Err(error) = restore_desired_state().await {
+                    tracing::warn!(
+                        "Desired state restoration failed; keeping IPC available for GUI recovery: {}",
+                        error
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                "Service startup reconciliation failed; core starts remain blocked while IPC is available: {}",
+                error
+            ),
         }
 
         let result = run_ipc_supervisor_until_shutdown(async {
@@ -154,15 +180,28 @@ fn init_logger() {
 
 async fn run_standalone() -> Result<()> {
     let pid = std::process::id();
-    info!("Celestial Service - Standalone Mode");
+    info!("Clash Verge Service - Standalone Mode");
     info!("Current process PID: {}", pid);
 
     let Some(_owner_guard) = acquire_service_owner().await? else {
         return Ok(());
     };
 
-    reconcile_service_startup().await?;
-    restore_desired_state().await?;
+    // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
+    // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
+    match reconcile_service_startup().await {
+        Ok(()) => {
+            if let Err(error) = restore_desired_state().await {
+                warn!(
+                    "Failed to restore desired core state on startup; core will not be auto-started. \
+                     Keeping the IPC server up so the GUI can reconnect and recover: {error:#}"
+                );
+            }
+        }
+        Err(error) => warn!(
+            "Service startup reconciliation failed; core starts remain blocked while IPC is available: {error:#}"
+        ),
+    }
 
     run_ipc_supervisor_until_shutdown(shutdown_signal()).await?;
 
@@ -176,7 +215,8 @@ async fn shutdown_signal() {
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to install SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
 
         tokio::select! {
             _ = sigint.recv() => info!("Received SIGINT (Ctrl+C)"),
@@ -186,7 +226,9 @@ async fn shutdown_signal() {
 
     #[cfg(windows)]
     {
-        tokio::signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
         info!("Received Ctrl+C");
     }
 }

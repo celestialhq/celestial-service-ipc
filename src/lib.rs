@@ -1,29 +1,75 @@
+mod channel;
 mod core;
 
 #[cfg(feature = "client")]
 mod client;
 
-pub use core::{ClashConfig, CoreConfig, IpcCommand, ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig};
-pub use core::{ServicePaths, service_paths};
+pub use channel::{
+    CHANNEL_IDENTITY, ChannelIdentity, MACOS_APP_BUNDLE_ID, MACOS_SERVICE_ID, SERVICE_DISPLAY_NAME,
+    SERVICE_SLUG, WINDOWS_SERVICE_NAME,
+};
+pub use core::{
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, IpcCommand,
+    MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle,
+    OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset,
+    RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
+    ServiceLifecycleState, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
+    WriterConfig, mihomo_ipc_path, owner_key,
+};
+pub use core::{OwnerPaths, ServicePaths, service_paths};
 
 #[cfg(feature = "standalone")]
 pub use core::{
-    DesiredState, ServiceOwnerGuard, acquire_service_owner, load_desired_state, persist_core_started,
-    persist_core_stopped, persist_writer_config, reconcile_service_startup, restore_desired_state, run_ipc_server,
-    run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_status_snapshot, set_service_lifecycle_state,
-    stop_ipc_server,
+    ActiveOwnerState, DesiredState, REPAIR_IN_PROGRESS_EXIT_CODE, ServiceOwnerGuard,
+    ServiceRepairGate, acquire_service_owner, acquire_service_repair_gate,
+    cleanup_stale_owner_state, load_active_owner, load_owner_desired_state,
+    prepare_service_install_directory, reconcile_service_startup, restore_desired_state,
+    run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state,
+    set_service_lifecycle_state, stop_ipc_server,
 };
 
+#[cfg(feature = "test")]
+pub use core::test_owner_credentials;
+#[cfg(all(feature = "test", unix))]
+pub use core::test_owner_credentials_for_uid;
+#[cfg(all(feature = "standalone", feature = "test"))]
+pub use core::write_core_runtime_record_for_tests;
 #[cfg(all(feature = "standalone", feature = "test"))]
 pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 
 #[cfg(feature = "client")]
 pub use client::*;
 
-#[cfg(all(unix, not(feature = "test")))]
-pub static IPC_PATH: &str = "/tmp/verge/celestial-service.sock";
-#[cfg(all(windows, not(feature = "test")))]
+#[cfg(all(
+    target_os = "macos",
+    not(feature = "test"),
+    not(feature = "development-channel")
+))]
+pub static IPC_PATH: &str = "/var/run/celestial-service/service.sock";
+#[cfg(all(
+    target_os = "macos",
+    not(feature = "test"),
+    feature = "development-channel"
+))]
+pub static IPC_PATH: &str = "/var/run/celestial-service-dev/service.sock";
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(feature = "test"),
+    not(feature = "development-channel")
+))]
+pub static IPC_PATH: &str = "/run/celestial-service/service.sock";
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(feature = "test"),
+    feature = "development-channel"
+))]
+pub static IPC_PATH: &str = "/run/celestial-service-dev/service.sock";
+#[cfg(all(windows, not(feature = "test"), not(feature = "development-channel")))]
 pub static IPC_PATH: &str = r"\\.\pipe\celestial-service";
+#[cfg(all(windows, not(feature = "test"), feature = "development-channel"))]
+pub static IPC_PATH: &str = r"\\.\pipe\celestial-service-dev";
 
 #[cfg(all(feature = "test", unix))]
 pub static IPC_PATH: &str = "/tmp/celestial-service-ipc-test/service.sock";
@@ -31,7 +77,10 @@ pub static IPC_PATH: &str = "/tmp/celestial-service-ipc-test/service.sock";
 pub static IPC_PATH: &str = r"\\.\pipe\celestial-service-test";
 
 #[cfg(any(feature = "standalone", feature = "client"))]
-pub static IPC_AUTH_EXPECT: &str =
-    r#"A thing of beauty is a joy for ever. Its loveliness increases; it will never pass into nothingness."#;
+pub static IPC_AUTH_EXPECT: &str = r#"A thing of beauty is a joy for ever. Its loveliness increases; it will never pass into nothingness."#;
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const PROTOCOL_EPOCH: u16 = 2;
+pub const PROTOCOL_REVISION: u16 = 1;
+pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 1;
+pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 1;

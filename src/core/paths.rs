@@ -1,6 +1,5 @@
+use crate::core::structure::{OwnerIdentity, owner_key};
 use std::path::{Path, PathBuf};
-
-const SERVICE_NAME: &str = "celestial-service";
 
 #[derive(Debug, Clone)]
 pub struct ServicePaths {
@@ -11,6 +10,11 @@ pub struct ServicePaths {
     pid_file_path: PathBuf,
     core_runtime_path: PathBuf,
     desired_state_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnerPaths {
+    root: PathBuf,
 }
 
 impl ServicePaths {
@@ -41,6 +45,46 @@ impl ServicePaths {
     pub fn desired_state_path(&self) -> &Path {
         &self.desired_state_path
     }
+
+    pub fn install_dir(&self) -> PathBuf {
+        self.persistent_state_dir.join("bin")
+    }
+
+    pub fn active_owner_path(&self) -> PathBuf {
+        self.persistent_state_dir.join("active-owner.json")
+    }
+
+    pub fn owner_generation_path(&self) -> PathBuf {
+        self.persistent_state_dir.join("owner-generation.json")
+    }
+
+    pub fn for_owner(&self, identity: &OwnerIdentity) -> OwnerPaths {
+        self.for_owner_key(&owner_key(identity))
+    }
+
+    pub fn for_owner_key(&self, owner_key: &str) -> OwnerPaths {
+        OwnerPaths {
+            root: self.persistent_state_dir.join("users").join(owner_key),
+        }
+    }
+}
+
+impl OwnerPaths {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn desired_state_path(&self) -> PathBuf {
+        self.root.join("desired-state.json")
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root.join("runtime")
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
 }
 
 pub fn service_paths() -> ServicePaths {
@@ -50,11 +94,74 @@ pub fn service_paths() -> ServicePaths {
         desired_state_path: persistent_state_dir.join("desired-state.json"),
         persistent_state_dir,
         ipc_path: PathBuf::from(crate::IPC_PATH),
-        owner_lock_path: runtime_dir.join(format!("{SERVICE_NAME}.owner.lock")),
-        pid_file_path: runtime_dir.join(format!("{SERVICE_NAME}.pid")),
-        core_runtime_path: runtime_dir.join(format!("{SERVICE_NAME}.core.json")),
+        owner_lock_path: runtime_dir.join(format!("{}.owner.lock", crate::SERVICE_SLUG)),
+        pid_file_path: runtime_dir.join(format!("{}.pid", crate::SERVICE_SLUG)),
+        core_runtime_path: runtime_dir.join(format!("{}.core.json", crate::SERVICE_SLUG)),
         runtime_dir,
     }
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
+    let paths = service_paths();
+    let root = paths.persistent_state_dir();
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(root)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(root)?;
+
+    let users = root.join("users");
+    let install = paths.install_dir();
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(&users)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(&users)?;
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(&install)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(&install)?;
+    #[cfg(unix)]
+    crate::core::unix_security::secure_service_file_if_exists(&paths.active_owner_path())?;
+    #[cfg(windows)]
+    crate::core::windows_security::secure_private_service_file_if_exists(
+        &paths.active_owner_path(),
+    )?;
+    #[cfg(unix)]
+    crate::core::unix_security::secure_service_file_if_exists(&paths.owner_generation_path())?;
+    #[cfg(windows)]
+    crate::core::windows_security::secure_private_service_file_if_exists(
+        &paths.owner_generation_path(),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "standalone")]
+pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
+    let paths = service_paths();
+    let root = paths.persistent_state_dir();
+    let install = paths.install_dir();
+    #[cfg(unix)]
+    {
+        crate::core::unix_security::ensure_private_service_directory(root)?;
+        crate::core::unix_security::ensure_private_service_directory(&install)?;
+    }
+    #[cfg(windows)]
+    {
+        crate::core::windows_security::ensure_private_installer_directory(root)?;
+        crate::core::windows_security::ensure_private_installer_directory(&install)?;
+    }
+    Ok(install)
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn ensure_owner_state_directory(identity: &OwnerIdentity) -> anyhow::Result<OwnerPaths> {
+    ensure_persistent_state_layout()?;
+    let owner = service_paths().for_owner(identity);
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(owner.root())?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(owner.root())?;
+    Ok(owner)
 }
 
 fn runtime_dir() -> PathBuf {
@@ -63,12 +170,12 @@ fn runtime_dir() -> PathBuf {
         Path::new(crate::IPC_PATH)
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/tmp/verge"))
+            .unwrap_or_else(|| PathBuf::from("/run/celestial-service"))
     }
 
     #[cfg(windows)]
     {
-        std::env::temp_dir().join(SERVICE_NAME)
+        persistent_state_dir().join("runtime")
     }
 }
 
@@ -78,31 +185,149 @@ fn persistent_state_dir() -> PathBuf {
         std::env::temp_dir().join("celestial-service-ipc-test-state")
     }
 
-    #[cfg(all(unix, not(feature = "test")))]
+    // macOS：系统 daemon 以 root 运行,状态目录用系统级稳定位置,不依赖 launchd 下不可靠的
+    // HOME/XDG —— 否则 desired-state 可能写一处读另一处而丢失(issue #7333)。
+    #[cfg(all(target_os = "macos", not(feature = "test")))]
     {
-        if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-            return PathBuf::from(path).join(SERVICE_NAME);
-        }
+        PathBuf::from("/Library/Application Support").join(crate::SERVICE_SLUG)
+    }
 
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(".local").join("state").join(SERVICE_NAME);
-        }
-
-        PathBuf::from("/var/lib").join(SERVICE_NAME)
+    #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
+    {
+        PathBuf::from("/var/lib").join(crate::SERVICE_SLUG)
     }
 
     #[cfg(all(windows, not(feature = "test")))]
     {
-        if let Some(path) = std::env::var_os("ProgramData") {
-            return PathBuf::from(path).join(SERVICE_NAME);
-        }
+        windows_program_data()
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join(crate::SERVICE_SLUG)
+    }
+}
 
-        if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(path).join(SERVICE_NAME);
-        }
+#[cfg(all(windows, not(feature = "test")))]
+fn windows_program_data() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(SERVICE_NAME)
+    let mut raw = std::ptr::null_mut();
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut raw) };
+    if status < 0 || raw.is_null() {
+        return None;
+    }
+    let length = unsafe {
+        let mut length = 0;
+        while *raw.add(length) != 0 {
+            length += 1;
+        }
+        length
+    };
+    let value = std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(raw, length) });
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Some(PathBuf::from(value))
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
+    runtime_root
+        .join("users")
+        .join(uid.to_string())
+        .join("verge-mihomo.sock")
+}
+
+pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
+    match identity {
+        OwnerIdentity::Unix { uid: _uid, .. } => {
+            #[cfg(windows)]
+            {
+                let channel_id = if cfg!(feature = "test") {
+                    "test"
+                } else {
+                    crate::CHANNEL_IDENTITY.id
+                };
+                format!(
+                    r"\\.\pipe\verge-mihomo-{}-{}",
+                    channel_id,
+                    owner_key(identity)
+                )
+            }
+
+            #[cfg(unix)]
+            {
+                #[cfg(feature = "test")]
+                let runtime_root = PathBuf::from("/tmp/celestial-service-ipc-test");
+                #[cfg(not(feature = "test"))]
+                let runtime_root = service_paths().runtime_dir().to_path_buf();
+
+                unix_mihomo_ipc_path(&runtime_root, *_uid)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        }
+        OwnerIdentity::Windows { .. } => {
+            let channel_id = if cfg!(feature = "test") {
+                "test"
+            } else {
+                crate::CHANNEL_IDENTITY.id
+            };
+            format!(
+                r"\\.\pipe\verge-mihomo-{}-{}",
+                channel_id,
+                owner_key(identity)
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_paths;
+    #[cfg(unix)]
+    use super::unix_mihomo_ipc_path;
+    use crate::OwnerIdentity;
+    #[cfg(unix)]
+    use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mihomo_ipc_path_is_owner_scoped_and_below_sun_path_limit() {
+        let path = unix_mihomo_ipc_path(Path::new("/var/run/celestial-service"), 501);
+
+        assert_eq!(
+            path,
+            Path::new("/var/run/celestial-service/users/501/verge-mihomo.sock")
+        );
+        assert!(path.as_os_str().as_encoded_bytes().len() < 104);
+    }
+
+    #[test]
+    fn owner_paths_isolate_state_runtime_and_logs() {
+        let paths = service_paths();
+        let owner = paths.for_owner(&OwnerIdentity::Unix { uid: 501, gid: 20 });
+
+        assert!(owner.root().ends_with("users/501"));
+        assert_eq!(
+            owner.desired_state_path(),
+            owner.root().join("desired-state.json")
+        );
+        assert_eq!(owner.runtime_dir(), owner.root().join("runtime"));
+        assert_eq!(owner.logs_dir(), owner.root().join("logs"));
+        assert_eq!(
+            paths.active_owner_path(),
+            paths.persistent_state_dir().join("active-owner.json")
+        );
+    }
+
+    #[cfg(all(windows, feature = "test"))]
+    #[test]
+    fn windows_test_mihomo_pipe_does_not_use_a_production_namespace() {
+        let path = super::mihomo_ipc_path(&OwnerIdentity::Windows {
+            sid: "S-1-5-21-1-2-3-1001".to_owned(),
+        });
+
+        assert!(path.starts_with(r"\\.\pipe\verge-mihomo-test-"));
+        assert!(!path.contains("verge-mihomo-production"));
     }
 }
