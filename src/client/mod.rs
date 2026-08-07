@@ -16,8 +16,8 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
-    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest,
-    StartClashResult, WriterConfig,
+    ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest,
+    StartClashResult, VersionReply, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -104,14 +104,19 @@ pub fn is_ipc_path_exists() -> bool {
     Path::new(IPC_PATH).exists()
 }
 
-pub async fn get_version() -> Result<Response<ProtocolInfo>> {
+/// Ask the service which protocol it speaks.
+///
+/// Returns [`VersionReply`] rather than [`ProtocolInfo`] so that a helper predating the
+/// handshake — which answers with a bare version string — still parses. Insisting on the
+/// struct made the one reply this call exists to recognise fail as a serialization error.
+pub async fn get_version() -> Result<Response<VersionReply>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetVersion.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<ProtocolInfo>>()?;
+        .json::<Response<VersionReply>>()?;
     Ok(response)
 }
 
@@ -133,7 +138,10 @@ pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<Servi
 pub async fn is_reinstall_service_needed() -> bool {
     is_ipc_path_exists()
         && match get_version().await {
-            Ok(resp) => resp.data.is_none_or(|info| {
+            // A reply carrying no protocol description at all — absent, or the bare
+            // version string a pre-handshake helper sends — is by definition a service
+            // that cannot state it supports us, so it needs reinstalling.
+            Ok(resp) => resp.data.as_ref().and_then(VersionReply::protocol).is_none_or(|info| {
                 !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
             }),
             Err(_) => true,

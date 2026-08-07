@@ -87,6 +87,9 @@ mod tests {
         assert!(version_data.is_some(), "Version data should not be None");
 
         let version = version_data.unwrap();
+        let version = version
+            .protocol()
+            .expect("a current service must report a protocol description, not a bare version");
         assert_eq!(version.build_version, VERSION);
         assert_eq!(version.protocol.epoch, PROTOCOL_EPOCH);
         assert_eq!(version.protocol.revision, PROTOCOL_REVISION);

@@ -49,6 +49,8 @@ async fn probe_protocol() -> anyhow::Result<()> {
         let response = get_version().await?;
         let info = response
             .data
+            .as_ref()
+            .and_then(celestial_service_ipc::VersionReply::protocol)
             .ok_or_else(|| anyhow::anyhow!("service omitted protocol information"))?;
         if response.code != 0
             || !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)

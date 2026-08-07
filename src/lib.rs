@@ -14,7 +14,7 @@ pub use core::{
     OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset,
     RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
     ServiceLifecycleState, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
-    WriterConfig, mihomo_ipc_path, owner_key,
+    VersionReply, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{OwnerPaths, ServicePaths, service_paths};
 

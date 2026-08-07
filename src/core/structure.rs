@@ -41,6 +41,42 @@ pub struct ProtocolInfo {
     pub min_client_revision: u16,
 }
 
+/// What a service answered when asked for its version.
+///
+/// Helpers built before the protocol handshake replied with a bare version string where
+/// a [`ProtocolInfo`] now goes. That reply is precisely the case the handshake exists to
+/// detect, so it has to *parse*: refusing it turns "this helper predates the handshake,
+/// reinstall it" into a serialization error the user cannot act on, and — worse — makes
+/// an old-but-reachable service indistinguishable from an unreachable one, so the client
+/// retries it instead of offering the reinstall that would fix it.
+///
+/// Untagged, with the struct first: a JSON object cannot match `Legacy`, and a JSON
+/// string cannot match `Protocol`, so the two are unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VersionReply {
+    Protocol(ProtocolInfo),
+    Legacy(String),
+}
+
+impl VersionReply {
+    /// The protocol description, when the service was new enough to send one.
+    pub const fn protocol(&self) -> Option<&ProtocolInfo> {
+        match self {
+            Self::Protocol(info) => Some(info),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// The bare version string of a service that predates the handshake.
+    pub fn legacy_version(&self) -> Option<&str> {
+        match self {
+            Self::Protocol(_) => None,
+            Self::Legacy(version) => Some(version.as_str()),
+        }
+    }
+}
+
 impl ProtocolInfo {
     pub fn current() -> Self {
         Self {
@@ -296,9 +332,42 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle,
-        ServiceErrorCode, StartClashRequest, owner_key,
+        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, Response, RuntimeBundle,
+        ServiceErrorCode, StartClashRequest, VersionReply, owner_key,
     };
+
+    #[test]
+    fn a_pre_handshake_service_version_still_parses() {
+        // The exact shape a 2.3.0 helper sends. Rejecting it used to surface as
+        // "invalid type: string \"2.3.0\", expected struct ProtocolInfo", which told the
+        // user nothing and hid the one conclusion worth drawing: reinstall the service.
+        let raw = r#"{"code":0,"message":"success","data":"2.3.0"}"#;
+
+        let response: Response<VersionReply> =
+            serde_json::from_str(raw).expect("a legacy version reply must parse");
+
+        let data = response.data.expect("data should be present");
+        assert_eq!(data.legacy_version(), Some("2.3.0"));
+        assert_eq!(data.protocol(), None, "a bare string carries no protocol description");
+    }
+
+    #[test]
+    fn a_current_service_version_still_parses_as_the_struct() {
+        let info = ProtocolInfo::current();
+        let raw = serde_json::to_string(&Response {
+            code: 0,
+            message: "success".to_owned(),
+            data: Some(VersionReply::Protocol(info.clone())),
+        })
+        .expect("response should serialize");
+
+        let response: Response<VersionReply> =
+            serde_json::from_str(&raw).expect("a current version reply must parse");
+
+        let data = response.data.expect("data should be present");
+        assert_eq!(data.protocol(), Some(&info));
+        assert_eq!(data.legacy_version(), None);
+    }
 
     #[test]
     fn service_250_contract_round_trips_owner_session_and_proxy() {

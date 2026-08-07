@@ -7,7 +7,8 @@ pub use structure::{
     OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
     ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset, RuntimeBundle,
     SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
-    ServiceStatusSnapshot, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    ServiceStatusSnapshot, StartClashRequest, StartClashResult, VersionReply, WriterConfig,
+    owner_key,
 };
 
 pub mod paths;
