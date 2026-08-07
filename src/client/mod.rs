@@ -16,12 +16,13 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
-    ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest,
-    StartClashResult, VersionReply, WriterConfig,
+    ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
+    VersionReply, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
-static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> = Lazy::new(|| Arc::new(RwLock::new(None)));
+static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -141,9 +142,13 @@ pub async fn is_reinstall_service_needed() -> bool {
             // A reply carrying no protocol description at all — absent, or the bare
             // version string a pre-handshake helper sends — is by definition a service
             // that cannot state it supports us, so it needs reinstalling.
-            Ok(resp) => resp.data.as_ref().and_then(VersionReply::protocol).is_none_or(|info| {
-                !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
-            }),
+            Ok(resp) => resp
+                .data
+                .as_ref()
+                .and_then(VersionReply::protocol)
+                .is_none_or(|info| {
+                    !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
+                }),
             Err(_) => true,
         }
 }

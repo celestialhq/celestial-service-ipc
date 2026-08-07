@@ -160,10 +160,8 @@ fn main() -> anyhow::Result<()> {
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = service_manager.open_service(
-        celestial_service_ipc::WINDOWS_SERVICE_NAME,
-        service_access,
-    )?;
+    let service = service_manager
+        .open_service(celestial_service_ipc::WINDOWS_SERVICE_NAME, service_access)?;
 
     let service_status = service.query_status()?;
     if service_status.current_state != ServiceState::Stopped {
@@ -201,8 +199,8 @@ fn main() -> anyhow::Result<()> {
         || thread::sleep(POLL_INTERVAL),
         "timed out waiting for service deletion",
     )?;
-    let target = celestial_service_ipc::prepare_service_install_directory()?
-        .join("celestial-service.exe");
+    let target =
+        celestial_service_ipc::prepare_service_install_directory()?.join("celestial-service.exe");
     if target.exists() {
         std::fs::remove_file(&target).map_err(|error| {
             anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")

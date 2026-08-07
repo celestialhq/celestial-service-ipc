@@ -221,9 +221,7 @@ async fn backup_legacy_desired_states() {
         .into_iter()
         .chain([
             std::path::PathBuf::from("/var/lib/celestial-service/desired-state.json"),
-            std::path::PathBuf::from(
-                "/var/root/.local/state/celestial-service/desired-state.json",
-            ),
+            std::path::PathBuf::from("/var/root/.local/state/celestial-service/desired-state.json"),
         ])
         .collect::<Vec<_>>();
 

@@ -324,10 +324,7 @@ fn main() -> Result<(), Error> {
     }
 
     // 创建并写入 launchd plist
-    let plist_file = plist_dir.join(format!(
-        "{}.plist",
-        celestial_service_ipc::MACOS_SERVICE_ID
-    ));
+    let plist_file = plist_dir.join(format!("{}.plist", celestial_service_ipc::MACOS_SERVICE_ID));
 
     let launchd_plist_content = format!(
         include_str!("../../resources/launchd.plist.tmpl"),
@@ -472,10 +469,8 @@ fn main() -> anyhow::Result<()> {
         | ServiceAccess::START
         | ServiceAccess::STOP
         | ServiceAccess::CHANGE_CONFIG;
-    match service_manager.open_service(
-        celestial_service_ipc::WINDOWS_SERVICE_NAME,
-        service_access,
-    ) {
+    match service_manager.open_service(celestial_service_ipc::WINDOWS_SERVICE_NAME, service_access)
+    {
         Ok(service) => {
             const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
             let status = service.query_status()?;

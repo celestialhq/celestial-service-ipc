@@ -348,7 +348,11 @@ mod tests {
 
         let data = response.data.expect("data should be present");
         assert_eq!(data.legacy_version(), Some("2.3.0"));
-        assert_eq!(data.protocol(), None, "a bare string carries no protocol description");
+        assert_eq!(
+            data.protocol(),
+            None,
+            "a bare string carries no protocol description"
+        );
     }
 
     #[test]
