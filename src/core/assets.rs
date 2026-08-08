@@ -307,7 +307,69 @@ pub(crate) async fn prepare_runtime(
         return Err(error);
     }
     prepared.stale_runtime_paths = snapshot_stale_runtime_directories(owner_root, &runtime).await;
+    carry_core_state_forward(&prepared.stale_runtime_paths, &runtime).await;
     Ok(prepared)
+}
+
+/// Files the core owns and accumulates, which must outlive the generation that produced them.
+///
+/// `cache.db` is where mihomo keeps `store-selected` and `store-fake-ip` state.
+const CORE_STATE_FILES: [&str; 1] = ["cache.db"];
+
+/// Carry the core's own state into the generation it is about to run in.
+///
+/// Each config apply gets a fresh generation directory, and that directory is the core's
+/// working directory — so anything the core writes beside its config is discarded with the
+/// generation that produced it. For `cache.db` that means the user's per-group proxy
+/// selections: every profile update silently reset every group back to its first node.
+///
+/// The generation model exists to make config *inputs* replaceable atomically. State the
+/// core accumulates is not an input, and copying it forward is what keeps the two ideas
+/// from contradicting each other. Failures are logged and ignored: a lost selection is
+/// worth a warning, not a refused config.
+async fn carry_core_state_forward(stale_runtimes: &[PathBuf], runtime: &Path) {
+    let Some(previous) = newest_runtime_generation(stale_runtimes).await else {
+        return;
+    };
+
+    for name in CORE_STATE_FILES {
+        let from = previous.join(name);
+        let to = runtime.join(name);
+        match tokio::fs::copy(&from, &to).await {
+            Ok(_) => {
+                tracing::debug!(from = ?from, to = ?to, "Carried core state into the new runtime generation")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                from = ?from,
+                to = ?to,
+                error = %error,
+                "Failed to carry core state forward; the core will start from a clean state"
+            ),
+        }
+    }
+}
+
+/// The generation the core most recently ran in.
+///
+/// Chosen by modification time rather than by name: the directory suffix embeds a process
+/// id before its timestamp, so sorting by name orders by whichever process wrote it.
+async fn newest_runtime_generation(runtimes: &[PathBuf]) -> Option<PathBuf> {
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+
+    for path in runtimes {
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| modified > *best) {
+            newest = Some((path.clone(), modified));
+        }
+    }
+
+    newest.map(|(path, _)| path)
 }
 
 async fn materialize_runtime(
