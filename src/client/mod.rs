@@ -16,8 +16,8 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
-    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, ServiceStatusSnapshot,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, VersionReply, WriterConfig,
+    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, ServiceStatusSnapshot, StageRuntimeOutcome,
+    StartClashRequest, StartClashResult, VersionReply, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
