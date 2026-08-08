@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "celestial_service_ipc"
-version = "2.6.1"
+version = "2.6.2"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
