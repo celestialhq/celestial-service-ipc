@@ -16,8 +16,8 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
-    ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
-    VersionReply, WriterConfig,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, ServiceStatusSnapshot,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -34,6 +34,70 @@ fn protected<'a>(
         crate::SERVICE_PROTOCOL_HEADER,
         ProtocolVersion::current().header_value(),
     )
+}
+
+/// The verb a route answers on. Kept beside [`IpcCommand`], which deliberately carries only the
+/// path, so the two halves of a route's address travel together on this side of the wire.
+#[derive(Clone, Copy)]
+enum Verb {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+/// One protected request: connect, wrap the payload in the envelope the route expects, declare
+/// the protocol revision, send, decode.
+///
+/// Every route below is this call with different data. Routing the protocol header through here
+/// rather than through each caller is the point — a request that reaches the service without it
+/// is refused, and forgetting it was previously a runtime failure rather than an impossible one.
+///
+/// `session` chooses the envelope: routes that need only an authenticated owner pass `None`,
+/// routes that need proof of the current session pass `Some`.
+async fn protected_call<P, R>(
+    verb: Verb,
+    command: IpcCommand,
+    credentials: &OwnerCredentials,
+    session: Option<&OwnerSessionProof>,
+    payload: P,
+    timeout: Option<Duration>,
+) -> Result<Response<R>>
+where
+    P: serde::Serialize + for<'de> serde::Deserialize<'de>,
+    R: for<'de> serde::Deserialize<'de>,
+{
+    let client = connect().await?;
+    let body = match session {
+        None => AuthenticatedRequest {
+            credentials: credentials.clone(),
+            payload,
+        }
+        .to_json_value()?,
+        Some(session) => AuthenticatedSessionRequest {
+            credentials: credentials.clone(),
+            session: session.clone(),
+            payload,
+        }
+        .to_json_value()?,
+    };
+    let path = command.as_ref();
+    let request = protected(match verb {
+        Verb::Get => client.get(path),
+        Verb::Post => client.post(path),
+        Verb::Put => client.put(path),
+        Verb::Delete => client.delete(path),
+    });
+    let request = match timeout {
+        Some(timeout) => request.timeout(timeout),
+        None => request,
+    };
+    let response = request
+        .json_body(&body)
+        .send()
+        .await?
+        .json::<Response<R>>()?;
+    Ok(response)
 }
 
 #[derive(Debug, Clone)]
@@ -105,50 +169,27 @@ pub fn is_ipc_path_exists() -> bool {
     Path::new(IPC_PATH).exists()
 }
 
-/// Ask the service which protocol it speaks.
-///
-/// Returns [`VersionReply`] rather than [`ProtocolInfo`] so that a helper predating the
-/// handshake — which answers with a bare version string — still parses. Insisting on the
-/// struct made the one reply this call exists to recognise fail as a serialization error.
-pub async fn get_version() -> Result<Response<VersionReply>> {
+pub async fn get_version() -> Result<Response<ProtocolInfo>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetVersion.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<VersionReply>>()?;
+        .json::<Response<ProtocolInfo>>()?;
     Ok(response)
 }
 
 pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<ServiceStatusSnapshot>> {
-    let client = connect().await?;
-    let payload = AuthenticatedRequest {
-        credentials: credentials.clone(),
-        payload: (),
-    }
-    .to_json_value()?;
-    let response = protected(client.get(IpcCommand::Status.as_ref()))
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<ServiceStatusSnapshot>>()?;
-    Ok(response)
+    protected_call(Verb::Get, IpcCommand::Status, credentials, None, (), None).await
 }
 
 pub async fn is_reinstall_service_needed() -> bool {
     is_ipc_path_exists()
         && match get_version().await {
-            // A reply carrying no protocol description at all — absent, or the bare
-            // version string a pre-handshake helper sends — is by definition a service
-            // that cannot state it supports us, so it needs reinstalling.
-            Ok(resp) => resp
-                .data
-                .as_ref()
-                .and_then(VersionReply::protocol)
-                .is_none_or(|info| {
-                    !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
-                }),
+            Ok(resp) => resp.data.is_none_or(|info| {
+                !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
+            }),
             Err(_) => true,
         }
 }
@@ -157,71 +198,78 @@ pub async fn start_clash(
     credentials: &OwnerCredentials,
     body: &StartClashRequest,
 ) -> Result<Response<StartClashResult>> {
-    let client = connect().await?;
-    let payload = AuthenticatedRequest {
-        credentials: credentials.clone(),
-        payload: body.clone(),
-    }
-    .to_json_value()?;
-    let response = protected(client.post(IpcCommand::StartClash.as_ref()))
-        .timeout(LIFECYCLE_TIMEOUT)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<StartClashResult>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Post,
+        IpcCommand::StartClash,
+        credentials,
+        None,
+        body.clone(),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
 }
 
 pub async fn get_clash_logs(
     credentials: &OwnerCredentials,
 ) -> Result<Response<Vec<CompactString>>> {
-    let client = connect().await?;
-    let payload = AuthenticatedRequest {
-        credentials: credentials.clone(),
-        payload: (),
-    }
-    .to_json_value()?;
-    let response = protected(client.get(IpcCommand::GetClashLogs.as_ref()))
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<Vec<CompactString>>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Get,
+        IpcCommand::GetClashLogs,
+        credentials,
+        None,
+        (),
+        None,
+    )
+    .await
 }
 
 pub async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<Response<String>> {
-    let client = connect().await?;
-    let payload = AuthenticatedRequest {
-        credentials: credentials.clone(),
-        payload: (),
-    }
-    .to_json_value()?;
-    let response = protected(client.get(IpcCommand::GetClashLogSnapshot.as_ref()))
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<String>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Get,
+        IpcCommand::GetClashLogSnapshot,
+        credentials,
+        None,
+        (),
+        None,
+    )
+    .await
 }
 
 pub async fn stop_clash(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,
 ) -> Result<Response<()>> {
-    let client = connect().await?;
-    let payload = AuthenticatedSessionRequest {
-        credentials: credentials.clone(),
-        session: session.clone(),
-        payload: (),
-    }
-    .to_json_value()?;
-    let response = protected(client.delete(IpcCommand::StopClash.as_ref()))
-        .timeout(LIFECYCLE_TIMEOUT)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<()>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Delete,
+        IpcCommand::StopClash,
+        credentials,
+        Some(session),
+        (),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Ask the service to make the running core's generation match `body`, without restarting it.
+///
+/// Returns what the service decided, not whether it worked: a service that declines reports
+/// `RestartRequired` with a `code` of zero. Only the caller can act on that, by stopping and
+/// starting the core the way it did before staging existed. Gate the call on
+/// [`ProtocolInfo::supports_runtime_staging`] — an older service has no such route at all.
+pub async fn stage_runtime(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &RuntimeBundle,
+) -> Result<Response<StageRuntimeOutcome>> {
+    protected_call(
+        Verb::Put,
+        IpcCommand::StageRuntime,
+        credentials,
+        Some(session),
+        body.clone(),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
 }
 
 pub async fn update_writer(
@@ -229,19 +277,15 @@ pub async fn update_writer(
     session: &OwnerSessionProof,
     body: &WriterConfig,
 ) -> Result<Response<()>> {
-    let client = connect().await?;
-    let payload = AuthenticatedSessionRequest {
-        credentials: credentials.clone(),
-        session: session.clone(),
-        payload: body.clone(),
-    }
-    .to_json_value()?;
-    let response = protected(client.put(IpcCommand::UpdateWriter.as_ref()))
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<()>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Put,
+        IpcCommand::UpdateWriter,
+        credentials,
+        Some(session),
+        body.clone(),
+        None,
+    )
+    .await
 }
 
 pub async fn set_system_proxy(
@@ -249,17 +293,13 @@ pub async fn set_system_proxy(
     session: &OwnerSessionProof,
     body: &MacosProxyConfig,
 ) -> Result<Response<ProxyApplyOutcome>> {
-    let client = connect().await?;
-    let payload = AuthenticatedSessionRequest {
-        credentials: credentials.clone(),
-        session: session.clone(),
-        payload: body.clone(),
-    }
-    .to_json_value()?;
-    let response = protected(client.put(IpcCommand::SetSystemProxy.as_ref()))
-        .json_body(&payload)
-        .send()
-        .await?
-        .json::<Response<ProxyApplyOutcome>>()?;
-    Ok(response)
+    protected_call(
+        Verb::Put,
+        IpcCommand::SetSystemProxy,
+        credentials,
+        Some(session),
+        body.clone(),
+        None,
+    )
+    .await
 }

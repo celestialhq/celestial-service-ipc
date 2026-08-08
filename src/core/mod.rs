@@ -5,10 +5,10 @@ pub mod structure;
 pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, MacosProxyConfig,
     OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
-    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset, RuntimeBundle,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle,
     SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
-    ServiceStatusSnapshot, StartClashRequest, StartClashResult, VersionReply, WriterConfig,
-    owner_key,
+    ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest,
+    StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -16,8 +16,6 @@ pub mod paths;
 pub use paths::prepare_service_install_directory;
 pub use paths::{OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths};
 
-#[cfg(feature = "standalone")]
-mod assets;
 #[cfg(feature = "standalone")]
 mod atomic_file;
 #[cfg(feature = "standalone")]
@@ -45,6 +43,8 @@ mod repair;
 #[cfg(feature = "standalone")]
 mod runtime;
 #[cfg(feature = "standalone")]
+mod runtime_generation;
+#[cfg(feature = "standalone")]
 mod server;
 #[cfg(feature = "standalone")]
 mod state;
@@ -58,6 +58,15 @@ mod unix_security;
 mod windows_legacy_cleanup;
 #[cfg(all(feature = "standalone", windows))]
 mod windows_security;
+
+/// The platform's answer to "make this private to the service".
+///
+/// Two adapters, one name: every caller below asks `platform_security` and none of them repeats
+/// the `unix`/`windows` pair that used to sit at each call site.
+#[cfg(all(feature = "standalone", unix))]
+pub(in crate::core) use unix_security as platform_security;
+#[cfg(all(feature = "standalone", windows))]
+pub(in crate::core) use windows_security as platform_security;
 
 #[cfg(feature = "standalone")]
 pub use desired::{

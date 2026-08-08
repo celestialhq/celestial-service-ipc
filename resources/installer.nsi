@@ -1,6 +1,6 @@
-OutFile "CelestialServiceInstaller.exe"
+OutFile "ClashVergeServiceInstaller.exe"
 
-InstallDir "$PROGRAMFILES\CelestialService"
+InstallDir "$PROGRAMFILES\ClashVergeService"
 
 Page directory
 Page instfiles
@@ -12,7 +12,7 @@ Section "Install"
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
 
-    ExecShell "" "$INSTDIR\celestial-service-install.exe"
+    ExecShell "" "$INSTDIR\clash-verge-service-install.exe"
 SectionEnd
 
 Section "Uninstall"

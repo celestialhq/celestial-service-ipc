@@ -131,13 +131,29 @@ jobs:
           target: ${{ matrix.target }}
           features: standalone,client
 
-      - name: Inspect unsigned macOS binaries
+      - name: CodeSign macOS binaries
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
+          echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
+          security create-keychain -p github-actions github-actions.keychain
+          security default-keychain -s github-actions.keychain
+          security unlock-keychain -p github-actions github-actions.keychain
+          security import cert.p12 -k github-actions.keychain -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
+
           for bin in celestial-service celestial-service-install celestial-service-uninstall; do
             file "target/${{ matrix.target }}/release/$bin"
             lipo -info "target/${{ matrix.target }}/release/$bin" || true
+            codesign --force \
+              -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
+              --keychain github-actions.keychain \
+              --options runtime \
+              --timestamp \
+              --identifier "io.github.pius-pp.celestial-service-service-ipc" \
+              "target/${{ matrix.target }}/release/$bin"
+            codesign -dvv "target/${{ matrix.target }}/release/$bin"
+            codesign -d --entitlements /dev/stdout "target/${{ matrix.target }}/release/$bin"
           done
 
       - name: Package Windows binaries

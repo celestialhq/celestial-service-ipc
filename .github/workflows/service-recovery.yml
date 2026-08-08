@@ -57,11 +57,39 @@ jobs:
           set -euo pipefail
 
           service="celestial-service.service"
-          target/release/service-integration-driver ping
+
+          # `set -e` used to abort the job the moment the first ping failed, before reaching any of
+          # the diagnostics below — so a red run said only "not reachable within 20s" and nothing
+          # about why. Every failure path now reports first and exits second.
+          diagnose() {
+            echo "::group::systemctl status"
+            sudo systemctl status "$service" --no-pager --full || true
+            echo "::endgroup::"
+            echo "::group::journalctl -u $service"
+            sudo journalctl -u "$service" --no-pager --lines=200 || true
+            echo "::endgroup::"
+            echo "::group::service runtime directory"
+            sudo ls -la /run/celestial-service/ || true
+            id
+            echo "::endgroup::"
+          }
+
+          require_service_ready() {
+            if ! target/release/service-integration-driver ready; then
+              echo "$1"
+              diagnose
+              exit 1
+            fi
+          }
+
+          # Recovery is about the OS service process coming back. Probe the public protocol endpoint
+          # here; authenticated owner operations have their own fixtures in Service Integration.
+          require_service_ready "IPC was not reachable after installing the service"
 
           old_pid="$(systemctl show "$service" --property=MainPID --value)"
           if [ -z "$old_pid" ] || [ "$old_pid" = "0" ]; then
-            sudo systemctl status "$service" --no-pager
+            echo "Service reported no main PID"
+            diagnose
             exit 1
           fi
 
@@ -72,13 +100,14 @@ jobs:
             new_pid="$(systemctl show "$service" --property=MainPID --value)"
             active_state="$(systemctl show "$service" --property=ActiveState --value)"
             if [ "$active_state" = "active" ] && [ -n "$new_pid" ] && [ "$new_pid" != "0" ] && [ "$new_pid" != "$old_pid" ]; then
-              target/release/service-integration-driver ping
+              require_service_ready "IPC did not respond after the service restarted"
               echo "Recovered service PID $old_pid -> $new_pid"
               exit 0
             fi
           done
 
-          sudo systemctl status "$service" --no-pager
+          echo "Service did not restart after forced process exit"
+          diagnose
           exit 1
 
       - name: Kill service and verify recovery (macOS)
@@ -87,7 +116,28 @@ jobs:
           set -euo pipefail
 
           service_id="io.github.pius-pp.celestial-service.service"
-          target/release/service-integration-driver ping
+
+          diagnose() {
+            echo "::group::launchctl print"
+            sudo launchctl print "system/$service_id" || true
+            echo "::endgroup::"
+            echo "::group::service runtime directory"
+            sudo ls -la /var/run/celestial-service/ || true
+            id
+            echo "::endgroup::"
+          }
+
+          require_service_ready() {
+            if ! target/release/service-integration-driver ready; then
+              echo "$1"
+              diagnose
+              exit 1
+            fi
+          }
+
+          # Recovery is about the OS service process coming back. Probe the public protocol endpoint
+          # here; authenticated owner operations have their own fixtures in Service Integration.
+          require_service_ready "IPC was not reachable after installing the service"
 
           get_pid() {
             sudo launchctl print "system/$service_id" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / { print $2; exit }' || true
@@ -95,7 +145,8 @@ jobs:
 
           old_pid="$(get_pid)"
           if [ -z "$old_pid" ] || [ "$old_pid" = "-" ]; then
-            sudo launchctl print "system/$service_id"
+            echo "Service reported no PID"
+            diagnose
             exit 1
           fi
 
@@ -105,13 +156,14 @@ jobs:
             sleep 1
             new_pid="$(get_pid)"
             if [ -n "$new_pid" ] && [ "$new_pid" != "-" ] && [ "$new_pid" != "$old_pid" ]; then
-              target/release/service-integration-driver ping
+              require_service_ready "IPC did not respond after the service restarted"
               echo "Recovered service PID $old_pid -> $new_pid"
               exit 0
             fi
           done
 
-          sudo launchctl print "system/$service_id"
+          echo "Service did not restart after forced process exit"
+          diagnose
           exit 1
 
       - name: Install service (Windows)
@@ -128,8 +180,22 @@ jobs:
           $serviceName = "celestial_service"
           $driver = "$env:GITHUB_WORKSPACE\target\release\service-integration-driver.exe"
 
-          & $driver ping
+          function Show-Diagnostics {
+            Write-Host "::group::sc queryex"
+            sc.exe queryex $serviceName
+            Write-Host "::endgroup::"
+            Write-Host "::group::recent service events"
+            Get-WinEvent -FilterHashtable @{ LogName = "System"; StartTime = (Get-Date).AddMinutes(-10) } -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -like "*clash*verge*" } |
+              Format-List TimeCreated, Id, LevelDisplayName, Message
+            Write-Host "::endgroup::"
+          }
+
+          # Recovery is about the SCM-managed service process coming back. `ready` probes the public
+          # protocol endpoint without coupling this job to a synthetic user's credential fixture.
+          & $driver ready
           if ($LASTEXITCODE -ne 0) {
+            Show-Diagnostics
             throw "IPC was not reachable before killing the service process"
           }
 
@@ -147,8 +213,9 @@ jobs:
             $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
             $newPid = [int]$service.ProcessId
             if ($service.State -eq "Running" -and $newPid -gt 0 -and $newPid -ne $oldPid) {
-              & $driver ping
+              & $driver ready
               if ($LASTEXITCODE -ne 0) {
+                Show-Diagnostics
                 throw "IPC did not respond after service restart"
               }
               Write-Host "Recovered service PID $oldPid -> $newPid"
@@ -156,7 +223,7 @@ jobs:
             }
           }
 
-          sc.exe queryex $serviceName
+          Show-Diagnostics
           throw "Service did not restart after forced process exit"
 
       - name: Uninstall service (Unix)

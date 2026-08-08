@@ -1,5 +1,6 @@
 #![cfg(feature = "client")]
 
+use anyhow::Context as _;
 #[cfg(feature = "test")]
 use celestial_service_ipc::test_owner_credentials;
 use celestial_service_ipc::{
@@ -49,8 +50,6 @@ async fn probe_protocol() -> anyhow::Result<()> {
         let response = get_version().await?;
         let info = response
             .data
-            .as_ref()
-            .and_then(celestial_service_ipc::VersionReply::protocol)
             .ok_or_else(|| anyhow::anyhow!("service omitted protocol information"))?;
         if response.code != 0
             || !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
@@ -74,13 +73,20 @@ async fn wait_protocol_ready() -> anyhow::Result<()> {
 
     let result: anyhow::Result<()> = async {
         let deadline = Instant::now() + IPC_READY_TIMEOUT;
+        let mut last_error = None;
         while Instant::now() < deadline {
-            if probe_protocol().await.is_ok() {
-                return Ok(());
+            match probe_protocol().await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
             }
             sleep(IPC_PROBE_INTERVAL).await;
         }
-        anyhow::bail!("service protocol did not become ready within {IPC_READY_TIMEOUT:?}")
+        if let Some(error) = last_error {
+            anyhow::bail!(
+                "service protocol did not become ready within {IPC_READY_TIMEOUT:?}; last failure: {error:#}"
+            );
+        }
+        anyhow::bail!("service protocol did not become ready within {IPC_READY_TIMEOUT:?}");
     }
     .await;
 
@@ -93,6 +99,7 @@ async fn start_flow() -> anyhow::Result<()> {
     let config = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary_path()?,
     };
     let response = start_clash(
@@ -133,12 +140,17 @@ async fn stop_flow() -> anyhow::Result<()> {
 }
 
 fn session_token() -> anyhow::Result<String> {
-    Ok(std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")?)
+    std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")
+        .context("CLASH_VERGE_TEST_SESSION_TOKEN is required")
 }
 
 fn session_proof() -> anyhow::Result<OwnerSessionProof> {
+    let generation = std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")
+        .context("CLASH_VERGE_TEST_SESSION_GENERATION is required")?;
     Ok(OwnerSessionProof {
-        generation: std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")?.parse()?,
+        generation: generation
+            .parse()
+            .context("CLASH_VERGE_TEST_SESSION_GENERATION must be an unsigned integer")?,
         token: session_token()?,
     })
 }

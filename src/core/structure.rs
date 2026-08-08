@@ -41,42 +41,6 @@ pub struct ProtocolInfo {
     pub min_client_revision: u16,
 }
 
-/// What a service answered when asked for its version.
-///
-/// Helpers built before the protocol handshake replied with a bare version string where
-/// a [`ProtocolInfo`] now goes. That reply is precisely the case the handshake exists to
-/// detect, so it has to *parse*: refusing it turns "this helper predates the handshake,
-/// reinstall it" into a serialization error the user cannot act on, and — worse — makes
-/// an old-but-reachable service indistinguishable from an unreachable one, so the client
-/// retries it instead of offering the reinstall that would fix it.
-///
-/// Untagged, with the struct first: a JSON object cannot match `Legacy`, and a JSON
-/// string cannot match `Protocol`, so the two are unambiguous.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum VersionReply {
-    Protocol(ProtocolInfo),
-    Legacy(String),
-}
-
-impl VersionReply {
-    /// The protocol description, when the service was new enough to send one.
-    pub const fn protocol(&self) -> Option<&ProtocolInfo> {
-        match self {
-            Self::Protocol(info) => Some(info),
-            Self::Legacy(_) => None,
-        }
-    }
-
-    /// The bare version string of a service that predates the handshake.
-    pub fn legacy_version(&self) -> Option<&str> {
-        match self {
-            Self::Protocol(_) => None,
-            Self::Legacy(version) => Some(version.as_str()),
-        }
-    }
-}
-
 impl ProtocolInfo {
     pub fn current() -> Self {
         Self {
@@ -94,6 +58,16 @@ impl ProtocolInfo {
         self.protocol.epoch == client.epoch
             && self.protocol.revision >= min_service_revision
             && client.revision >= self.min_client_revision
+    }
+
+    /// Whether this service can stage a runtime in place instead of being stopped and restarted.
+    ///
+    /// Deliberately finer-grained than `supports_client`: an installed service that predates
+    /// staging is still fully *compatible*, so it must not be pushed into a reinstall. Callers
+    /// gate the fast path on this and fall back to stop + start when it is false.
+    pub const fn supports_runtime_staging(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING
     }
 }
 
@@ -129,16 +103,40 @@ pub struct AuthenticatedSessionRequest<T> {
     pub payload: T,
 }
 
+/// A file the client owns and the service copies into the runtime generation.
+///
+/// The distinction from [`RemoteProvider`] is who writes the file: these are copied in by the
+/// service and can therefore be compared against their source, so an unchanged one is skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAsset {
     pub source: String,
     pub destination: String,
 }
 
+/// A provider file the *core* fetches and owns; the service never writes it.
+///
+/// Recorded only so the service can tell a reusable download cache from a stale one. The core
+/// will not re-fetch a provider whose file already exists, so when `url` changes underneath an
+/// unchanged `destination` the cache must be deleted before the core reloads — otherwise it
+/// keeps serving the previous source's content until the provider's own interval elapses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteProvider {
+    pub destination: String,
+    pub url: String,
+}
+
+/// The complete declaration of what a runtime generation should contain.
+///
+/// "Complete" is load-bearing: staging decides what to delete by subtracting this declaration
+/// from what is on disk, so anything omitted here is something staging cannot reason about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBundle {
     pub yaml: String,
     pub assets: Vec<RuntimeAsset>,
+    /// Absent on the wire from clients older than revision 2; an empty list simply means
+    /// staging cannot distinguish a reusable cache from a stale one and keeps neither.
+    #[serde(default)]
+    pub remote_providers: Vec<RemoteProvider>,
     pub core_path: String,
 }
 
@@ -180,6 +178,44 @@ pub struct OwnerSessionHandle {
 pub struct StartClashResult {
     pub session: OwnerSessionHandle,
     pub proxy_outcome: ProxyApplyOutcome,
+}
+
+/// What staging a bundle into the running core's generation achieved.
+///
+/// `RestartRequired` is an outcome, not an error: staging is an optimisation that is allowed to
+/// decline. Every way of declining leaves the generation exactly as the running core left it,
+/// so the caller can fall back to stop + start — which builds a fresh generation and therefore
+/// has none of the constraints that made staging decline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StageRuntimeOutcome {
+    /// The generation now matches the bundle. The core still runs the previous configuration
+    /// until the caller points it at `config_path`.
+    Staged {
+        config_path: String,
+    },
+    RestartRequired {
+        reason: StageRejection,
+    },
+}
+
+/// Why staging declined. Each variant is a fact only the service can establish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum StageRejection {
+    /// No core is running, so there is nothing to reload into.
+    CoreNotRunning,
+    /// The bundle names a different core binary. A configuration reload would succeed and
+    /// silently leave the previous binary running, which is worse than declining.
+    CorePathChanged,
+    /// A file that had to be replaced or removed could not be. Expected on Windows, where the
+    /// running core holds handles on its provider files.
+    RuntimeUnwritable { detail: String },
+    /// The core was replaced while the runtime was being staged, so the work done so far was done
+    /// for a core that is no longer there. The service's own watchdog can do this, and it restarts
+    /// the core from the configuration still on disk — meaning the generation may now be serving a
+    /// mixture nothing recorded.
+    CoreRestarted,
 }
 
 #[repr(u16)]
@@ -332,46 +368,9 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, Response, RuntimeBundle,
-        ServiceErrorCode, StartClashRequest, VersionReply, owner_key,
+        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle,
+        ServiceErrorCode, StartClashRequest, owner_key,
     };
-
-    #[test]
-    fn a_pre_handshake_service_version_still_parses() {
-        // The exact shape a 2.3.0 helper sends. Rejecting it used to surface as
-        // "invalid type: string \"2.3.0\", expected struct ProtocolInfo", which told the
-        // user nothing and hid the one conclusion worth drawing: reinstall the service.
-        let raw = r#"{"code":0,"message":"success","data":"2.3.0"}"#;
-
-        let response: Response<VersionReply> =
-            serde_json::from_str(raw).expect("a legacy version reply must parse");
-
-        let data = response.data.expect("data should be present");
-        assert_eq!(data.legacy_version(), Some("2.3.0"));
-        assert_eq!(
-            data.protocol(),
-            None,
-            "a bare string carries no protocol description"
-        );
-    }
-
-    #[test]
-    fn a_current_service_version_still_parses_as_the_struct() {
-        let info = ProtocolInfo::current();
-        let raw = serde_json::to_string(&Response {
-            code: 0,
-            message: "success".to_owned(),
-            data: Some(VersionReply::Protocol(info.clone())),
-        })
-        .expect("response should serialize");
-
-        let response: Response<VersionReply> =
-            serde_json::from_str(&raw).expect("a current version reply must parse");
-
-        let data = response.data.expect("data should be present");
-        assert_eq!(data.protocol(), Some(&info));
-        assert_eq!(data.legacy_version(), None);
-    }
 
     #[test]
     fn service_250_contract_round_trips_owner_session_and_proxy() {
@@ -379,6 +378,7 @@ mod tests {
             runtime: RuntimeBundle {
                 yaml: "mode: rule\n".to_owned(),
                 assets: Vec::new(),
+                remote_providers: Vec::new(),
                 core_path: "/tmp/mihomo".to_owned(),
             },
             proposed_session_token: "11".repeat(32),
@@ -411,6 +411,37 @@ mod tests {
             Some(current)
         );
         assert!(ProtocolVersion::parse_header(crate::VERSION).is_none());
+    }
+
+    #[test]
+    fn staging_is_gated_separately_from_compatibility() {
+        let mut older = ProtocolInfo::current();
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING - 1;
+
+        assert!(
+            older.supports_client(
+                ProtocolVersion::current(),
+                crate::MIN_REQUIRED_SERVICE_REVISION
+            ),
+            "a service without staging is still a service this client can talk to"
+        );
+        assert!(
+            !older.supports_runtime_staging(),
+            "but it must not be asked to stage a runtime"
+        );
+        assert!(ProtocolInfo::current().supports_runtime_staging());
+    }
+
+    #[test]
+    fn staging_does_not_survive_an_epoch_change() {
+        let mut newer_epoch = ProtocolInfo::current();
+        newer_epoch.protocol.epoch += 1;
+        newer_epoch.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING;
+
+        assert!(
+            !newer_epoch.supports_runtime_staging(),
+            "a revision number means nothing across an epoch boundary"
+        );
     }
 
     #[test]

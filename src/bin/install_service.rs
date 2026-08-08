@@ -3,25 +3,22 @@ fn main() {
     panic!("This program is not intended to run on this platform.");
 }
 
+mod shared;
+
 use anyhow::Error;
 use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use shared::run_command;
+#[cfg(all(target_os = "macos", not(feature = "development-channel")))]
+use shared::uninstall_old_service;
+use shared::{enter_repair_gate, run_maintenance_if_requested};
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-fn enter_repair_gate() -> Result<celestial_service_ipc::ServiceRepairGate, Error> {
-    match celestial_service_ipc::acquire_service_repair_gate()? {
-        Some(gate) => Ok(gate),
-        None => {
-            eprintln!("Service repair is already in progress");
-            std::process::exit(celestial_service_ipc::REPAIR_IN_PROGRESS_EXIT_CODE);
-        }
-    }
-}
 
 fn bundled_service_binary() -> Result<PathBuf, Error> {
     let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
@@ -172,16 +169,12 @@ fn wait_for_service_ready() -> Result<(), Error> {
         let result = loop {
             if let Ok(response) = celestial_service_ipc::get_version().await
                 && response.code == 0
-                && response
-                    .data
-                    .as_ref()
-                    .and_then(celestial_service_ipc::VersionReply::protocol)
-                    .is_some_and(|info| {
-                        info.supports_client(
-                            celestial_service_ipc::ProtocolVersion::current(),
-                            celestial_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
-                        )
-                    })
+                && response.data.is_some_and(|info| {
+                    info.supports_client(
+                        celestial_service_ipc::ProtocolVersion::current(),
+                        celestial_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
+                    )
+                })
             {
                 break Ok(());
             }
@@ -198,7 +191,9 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+// Only launchd code calls this, and the tests below exercise the plan classifier rather than the
+// target string — so widening the gate to `test` only made it dead code everywhere but macOS.
+#[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("system/{}", celestial_service_ipc::MACOS_SERVICE_ID)
 }
@@ -245,15 +240,6 @@ fn probe_launchd_service(debug: bool) -> Result<LaunchdInstallPlan, Error> {
     );
 
     classify_launchd_service_probe(output.status.code(), &diagnostic)
-}
-
-fn run_maintenance_if_requested() -> Result<bool, Error> {
-    if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
-        return Ok(false);
-    }
-    let removed = celestial_service_ipc::cleanup_stale_owner_state()?;
-    println!("Removed {} stale owner state directories", removed.len());
-    Ok(true)
 }
 
 #[cfg(unix)]
@@ -544,69 +530,6 @@ fn configure_windows_service_recovery(
     service.set_failure_actions_on_non_crash_failures(true)?;
 
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-pub fn uninstall_old_service() -> Result<(), Error> {
-    use std::path::Path;
-
-    let target_binary_path = "/Library/PrivilegedHelperTools/io.github.clashverge.helper";
-    let plist_file = "/Library/LaunchDaemons/io.github.clashverge.helper.plist";
-
-    // Stop and unload service
-    run_command("launchctl", &["stop", "io.github.clashverge.helper"], false)?;
-    run_command("launchctl", &["bootout", "system", plist_file], false)?;
-    run_command(
-        "launchctl",
-        &["disable", "system/io.github.clashverge.helper"],
-        false,
-    )?;
-
-    // Remove files
-    if Path::new(plist_file).exists() {
-        std::fs::remove_file(plist_file)
-            .map_err(|e| anyhow::anyhow!("Failed to remove plist file: {}", e))?;
-    }
-
-    if Path::new(target_binary_path).exists() {
-        std::fs::remove_file(target_binary_path)
-            .map_err(|e| anyhow::anyhow!("Failed to remove service binary: {}", e))?;
-    }
-
-    Ok(())
-}
-
-pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
-    if debug {
-        println!("Executing: {} {}", cmd, args.join(" "));
-    }
-
-    let output = std::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to execute '{}': {}", cmd, e))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if debug {
-        eprintln!(
-            "Command failed (status: {}):\nstdout: {}\nstderr: {}",
-            output.status, stdout, stderr
-        );
-    }
-
-    Err(anyhow::anyhow!(
-        "Command '{}' failed (status: {}):\nstdout: {}\nstderr: {}",
-        cmd,
-        output.status,
-        stdout,
-        stderr
-    ))
 }
 
 #[cfg(test)]

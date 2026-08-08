@@ -21,11 +21,13 @@ use celestial_service_ipc::{
 };
 use serde::Deserialize;
 use serial_test::serial;
+#[cfg(windows)]
 use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -35,31 +37,12 @@ const RUNTIME_LOCK_READY_ENV: &str = "SERVICE_IPC_TEST_RUNTIME_LOCK_READY";
 #[cfg(windows)]
 static RUNTIME_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn test_bin_path(name: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    path.push("debug");
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    path
-}
-
 #[cfg(unix)]
 fn owner_credentials_for_uid(name: &str, uid: u32) -> celestial_service_ipc::OwnerCredentials {
     let app_data_dir =
         std::env::temp_dir().join(format!("service-ipc-owner-{}-{name}", std::process::id()));
     celestial_service_ipc::test_owner_credentials_for_uid(&app_data_dir, uid)
         .expect("synthetic test owner credentials should be valid")
-}
-
-async fn wait_for_ipc() -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if connect().await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    anyhow::bail!("IPC server did not become ready")
 }
 
 #[cfg(windows)]
@@ -262,7 +245,7 @@ async fn wait_for_path_removal(path: &std::path::Path) -> Result<()> {
 
 #[cfg(windows)]
 fn windows_runtime_bundle(yaml: &str) -> Result<RuntimeBundle> {
-    let mock_binary = test_bin_path("mock_binary");
+    let mock_binary = common::test_bin_path("mock_binary");
     anyhow::ensure!(
         mock_binary.exists(),
         "missing mock_binary at {mock_binary:?}"
@@ -270,6 +253,7 @@ fn windows_runtime_bundle(yaml: &str) -> Result<RuntimeBundle> {
     Ok(RuntimeBundle {
         yaml: yaml.to_owned(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary.to_string_lossy().into_owned(),
     })
 }
@@ -302,9 +286,12 @@ async fn assert_new_runtime_config(
     expected_yaml: &str,
 ) -> Result<PathBuf> {
     let current = active_runtime_config_path(credentials).await?;
+    // The path is deliberately the same one: an owner keeps a single generation, so that the core
+    // keeps the state it writes there — `cache.db`, and with it the node the user picked. What a
+    // start must replace is the configuration inside it, not the directory around it.
     anyhow::ensure!(
-        current != previous,
-        "same-owner Start reused runtime generation {previous:?}"
+        current == previous,
+        "same-owner Start moved the runtime generation from {previous:?} to {current:?}"
     );
     anyhow::ensure!(
         std::fs::read_to_string(&current)? == expected_yaml,
@@ -321,7 +308,7 @@ async fn with_windows_ipc_server(
     let _ = stop_ipc_server().await;
     let mut server_handle = run_ipc_server().await?;
     let test_result = async {
-        wait_for_ipc().await?;
+        common::wait_for_ipc().await?;
         test.await
     }
     .await;
@@ -445,7 +432,7 @@ async fn protected_routes_reject_protocol_mismatch_before_deserialization() -> R
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
 
     let invalid = serde_json::Value::String("not an authenticated request".to_owned());
     let client = connect().await?;
@@ -476,6 +463,11 @@ async fn protected_routes_reject_protocol_mismatch_before_deserialization() -> R
             .send()
             .await?,
         client
+            .put(IpcCommand::StageRuntime.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
             .put(IpcCommand::UpdateWriter.as_ref())
             .json_body(&invalid)
             .send()
@@ -502,10 +494,10 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
 
     let credentials = common::owner_credentials();
-    let mock_binary = test_bin_path("mock_binary");
+    let mock_binary = common::test_bin_path("mock_binary");
     anyhow::ensure!(
         mock_binary.exists(),
         "missing mock_binary at {mock_binary:?}"
@@ -513,6 +505,7 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary.to_string_lossy().into_owned(),
     };
 
@@ -580,6 +573,7 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     assert!(committed.desired_core_should_be_running);
 
     let invalid = RuntimeBundle {
+        remote_providers: Vec::new(),
         core_path: mock_binary
             .with_file_name("missing-core")
             .to_string_lossy()
@@ -629,26 +623,26 @@ async fn windows_restart_does_not_wait_for_locked_stale_runtime_cleanup() -> Res
             "active runtime config is missing at {runtime_file:?}"
         );
 
+        let stale_generation = owner_paths.root().join("runtime.generation-locked");
+        std::fs::create_dir(&stale_generation)?;
+        let stale_generation_file = stale_generation.join("stale.lock");
+        std::fs::write(&stale_generation_file, b"stale")?;
         bundle.yaml = "mode: direct\n".to_owned();
         let restart_token = "a2".repeat(32);
         let (_, holder) = start_clash_while_runtime_file_is_locked(
             &credentials,
             &bundle,
             &restart_token,
-            &runtime_file,
+            &stale_generation_file,
         )
         .await?;
         let restarted_runtime_file =
             assert_new_runtime_config(&credentials, &runtime_file, "mode: direct\n").await?;
-        let previous_runtime = runtime_file
-            .parent()
-            .context("runtime config has no parent directory")?
-            .to_path_buf();
-        tokio::fs::symlink_metadata(&previous_runtime)
+        tokio::fs::symlink_metadata(&stale_generation)
             .await
-            .context("locked runtime generation disappeared before handle release")?;
+            .context("locked stale runtime generation disappeared before handle release")?;
         holder.release().await?;
-        wait_for_path_removal(&previous_runtime).await?;
+        wait_for_path_removal(&stale_generation).await?;
 
         let backup = owner_paths.root().join("runtime.backup");
         std::fs::create_dir(&backup)?;
@@ -687,7 +681,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let mut server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
 
     let owner_a = owner_credentials_for_uid("a", 91_001);
     let owner_b = owner_credentials_for_uid("b", 91_002);
@@ -698,7 +692,10 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
-        core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
+        remote_providers: Vec::new(),
+        core_path: common::test_bin_path("mock_binary")
+            .to_string_lossy()
+            .into_owned(),
     };
 
     let token_a = "66".repeat(32);
@@ -784,7 +781,8 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         0
     );
     let no_ipc_bundle = RuntimeBundle {
-        core_path: test_bin_path("no_ipc_binary")
+        remote_providers: Vec::new(),
+        core_path: common::test_bin_path("no_ipc_binary")
             .to_string_lossy()
             .into_owned(),
         ..bundle.clone()
@@ -860,7 +858,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     server_handle.await??;
     restore_desired_state().await?;
     server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
     let restored = get_status(active_owner)
         .await?
         .data

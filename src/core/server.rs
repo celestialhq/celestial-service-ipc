@@ -1,5 +1,3 @@
-use super::state::IpcState;
-use crate::core::assets::{PreparedRuntime, prepare_runtime};
 use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
     ipc_request_context_to_auth_context,
@@ -13,6 +11,7 @@ use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::paths::service_paths;
+use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, stage_runtime};
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
@@ -20,22 +19,23 @@ use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_prox
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION,
     MacosProxyConfig, OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
-    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
+    RuntimeBundle, SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
 use once_cell::sync::Lazy;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 #[cfg(feature = "test")]
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     future::Future,
+    ops::ControlFlow,
     time::{Duration, Instant},
 };
 #[cfg(feature = "test")]
 use tokio::sync::Notify;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, MutexGuard, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
@@ -119,17 +119,19 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
     }
 
     async fn start_new_core(&mut self) -> AnyResult<()> {
-        let clash_config = self
+        let prepared = self
             .prepared_runtime
             .as_ref()
-            .context("prepared runtime is unavailable")?
-            .clash_config()
-            .clone();
+            .context("prepared runtime is unavailable")?;
+        let clash_config = prepared.clash_config().clone();
+        // Only now, with the previous core stopped, is the generation safe to rewrite: it is the
+        // same directory that core was running in. Planning happened before anything was stopped,
+        // so a bundle the service refuses still costs no outage.
+        prepared
+            .materialize()
+            .await
+            .context("failed to materialize the runtime generation")?;
         let core_manager = CORE_MANAGER.lock().await;
-        self.prepared_runtime
-            .as_mut()
-            .context("prepared runtime disappeared before core start")?
-            .mark_may_be_in_use();
         let start_result = core_manager
             .start_core(clash_config, self.owner.identity.clone())
             .await;
@@ -141,13 +143,9 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
                 ));
             }
             let _ = persist_owner_core_stopped(self.owner).await;
-            if let Some(prepared_runtime) = self.prepared_runtime.take()
-                && let Err(cleanup_error) = prepared_runtime.discard_after_core_stopped().await
-            {
-                return Err(anyhow!(
-                    "{error:#}; failed to discard rejected runtime generation: {cleanup_error}"
-                ));
-            }
+            // The generation stays. It is the owner's one runtime directory, holding the core's
+            // own state, and what it describes now is a configuration this service accepted — the
+            // same one a retry would write again.
             return Err(error);
         }
         Ok(())
@@ -180,61 +178,43 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
 }
 
 impl StartOwnerTransition<'_> {
-    async fn discard_unstarted_runtime(&mut self) -> AnyResult<()> {
-        let Some(prepared_runtime) = self.prepared_runtime.as_ref() else {
-            return Ok(());
-        };
-        if !prepared_runtime.is_unused() {
-            return Ok(());
-        }
-        self.prepared_runtime
-            .take()
-            .context("unused prepared runtime disappeared before discard")?
-            .discard_after_core_stopped()
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
     async fn rollback_commit_failure<T>(&mut self, error: anyhow::Error) -> AnyResult<T> {
         if let Err(rollback_error) = rollback_started_owner(self.owner).await {
             return Err(anyhow!(
                 "{error:#}; failed to roll back uncommitted owner core: {rollback_error:#}"
             ));
         }
-        if let Some(prepared_runtime) = self.prepared_runtime.take()
-            && let Err(cleanup_error) = prepared_runtime.discard_after_core_stopped().await
-        {
-            return Err(anyhow!(
-                "{error:#}; failed to discard uncommitted runtime generation: {cleanup_error}"
-            ));
-        }
+        // The prepared runtime is dropped rather than discarded: the generation is the owner's
+        // durable directory, so rolling back the *owner* leaves nothing on disk to undo.
+        self.prepared_runtime.take();
         Err(error)
     }
 }
 
-#[cfg(all(target_os = "macos", not(feature = "test")))]
+/// Whether this build drives the machine's proxy settings.
+///
+/// Only macOS has a backend behind `proxy`, and a `test` build must not reach the developer's
+/// real settings — so everywhere else the verbs below stay callable and do nothing, rather than
+/// each caller having to know which platform it is on.
+const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = "test")));
+
 async fn clear_service_proxy() -> AnyResult<()> {
-    clear_proxy().await
+    if SERVICE_PROXY_IS_LIVE {
+        clear_proxy().await
+    } else {
+        Ok(())
+    }
 }
 
-#[cfg(any(not(target_os = "macos"), feature = "test"))]
-async fn clear_service_proxy() -> AnyResult<()> {
-    let _ = clear_proxy;
-    Ok(())
-}
-
-#[cfg(all(target_os = "macos", not(feature = "test")))]
 async fn compensate_service_proxy() -> AnyResult<()> {
-    apply_proxy(&MacosProxyConfig::Disabled).await
+    if SERVICE_PROXY_IS_LIVE {
+        apply_proxy(&MacosProxyConfig::Disabled).await
+    } else {
+        Ok(())
+    }
 }
 
-#[cfg(any(not(target_os = "macos"), feature = "test"))]
-async fn compensate_service_proxy() -> AnyResult<()> {
-    let _ = apply_proxy;
-    Ok(())
-}
-
-#[cfg(all(target_os = "macos", not(feature = "test")))]
+#[cfg(not(feature = "test"))]
 async fn apply_service_proxy_or_direct(
     config: Option<&MacosProxyConfig>,
 ) -> AnyResult<ProxyApplyOutcome> {
@@ -252,13 +232,6 @@ async fn apply_service_proxy_or_direct(
     } else {
         ProxyApplyOutcome::NotRequested
     })
-}
-
-#[cfg(all(not(target_os = "macos"), not(feature = "test")))]
-async fn apply_service_proxy_or_direct(
-    config: Option<&MacosProxyConfig>,
-) -> AnyResult<ProxyApplyOutcome> {
-    apply_proxy_or_direct(config).await
 }
 
 async fn clear_proxy_with_direct_compensation() -> std::result::Result<(), ServiceError> {
@@ -301,6 +274,29 @@ async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
 // 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
 static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+/// The listener and the two ends of its shutdown handshake.
+///
+/// One supervisor owns all three at a time — `IPC_LIFECYCLE_LOCK` is what makes that true — but
+/// each is taken and replaced independently as a listener is torn down and rebuilt, so they are
+/// three cells rather than one.
+static IPC_SERVER: Lazy<Mutex<Option<IpcHttpServer>>> = Lazy::new(|| Mutex::new(None));
+static IPC_SHUTDOWN_SENDER: Lazy<Mutex<Option<oneshot::Sender<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+static IPC_SHUTDOWN_DONE: Lazy<Mutex<Option<oneshot::Receiver<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Tell the listener to stop, then forget it.
+///
+/// The order matters and is the only reason this is a function: dropping the handle without
+/// calling `shutdown` leaves the listener running with nobody holding it.
+async fn shutdown_ipc_server() {
+    let mut guard = IPC_SERVER.lock().await;
+    if let Some(server) = guard.as_mut() {
+        server.shutdown();
+    }
+    *guard = None;
+}
+
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     let _lifecycle_guard = IPC_LIFECYCLE_LOCK.lock().await;
 
@@ -311,10 +307,10 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
-    IpcState::global().set_sender(shutdown_tx).await;
-    IpcState::global().set_done(done_rx).await;
+    *IPC_SHUTDOWN_SENDER.lock().await = Some(shutdown_tx);
+    *IPC_SHUTDOWN_DONE.lock().await = Some(done_rx);
 
-    if let Some(mut server) = IpcState::global().take_server().await {
+    if let Some(mut server) = IPC_SERVER.lock().await.take() {
         let handle = tokio::spawn(async move {
             let res = tokio::select! {
                 res = server.serve() => res,
@@ -342,15 +338,15 @@ pub async fn stop_ipc_server() -> Result<()> {
         .await
         .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()))?;
 
-    if let Some(sender) = IpcState::global().take_sender().await {
+    if let Some(sender) = IPC_SHUTDOWN_SENDER.lock().await.take() {
         let _ = sender.send(());
     }
 
-    if let Some(done) = IpcState::global().take_done().await {
+    if let Some(done) = IPC_SHUTDOWN_DONE.lock().await.take() {
         let _ = done.await;
     }
 
-    IpcState::global().shutdown_server().await;
+    shutdown_ipc_server().await;
 
     cleanup_ipc_path().await?;
     #[cfg(windows)]
@@ -520,7 +516,7 @@ async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
-    IpcState::global().set_server(server).await;
+    *IPC_SERVER.lock().await = Some(server);
     Ok(())
 }
 
@@ -576,6 +572,90 @@ fn require_protocol_version(
         .ok_or_else(ServiceError::protocol_mismatch)
 }
 
+/// The two request envelopes a protected route can arrive in.
+///
+/// Both carry credentials in the same place, so a route's parse-and-authenticate step does not
+/// need to know which shape it just read.
+trait OwnerRequestEnvelope {
+    fn credentials(&self) -> &crate::OwnerCredentials;
+}
+
+impl<T> OwnerRequestEnvelope for AuthenticatedRequest<T> {
+    fn credentials(&self) -> &crate::OwnerCredentials {
+        &self.credentials
+    }
+}
+
+impl<T> OwnerRequestEnvelope for AuthenticatedSessionRequest<T> {
+    fn credentials(&self) -> &crate::OwnerCredentials {
+        &self.credentials
+    }
+}
+
+/// Protocol version, then deserialization, then owner authentication.
+///
+/// The order is load-bearing: a client speaking the wrong revision must be told so before its
+/// body is interpreted, and nothing may be authenticated against credentials that have not been
+/// parsed. Failures come back already encoded so a handler stays one `match`.
+///
+/// This deliberately stops short of the lifecycle lock. `StartClash` validates its payload in
+/// between, and must keep doing so before it waits on a contended lock.
+fn authenticate_request<E>(
+    ctx: &kode_bridge::RequestContext,
+) -> ControlFlow<Result<HttpResponse>, (E, AuthenticatedOwner)>
+where
+    E: DeserializeOwned + OwnerRequestEnvelope,
+{
+    if let Err(error) = require_protocol_version(ctx) {
+        return ControlFlow::Break(service_error(error));
+    }
+    let request = match ctx.json::<E>() {
+        Ok(request) => request,
+        Err(error) => return ControlFlow::Break(bad_request(format!("Invalid JSON: {error}"))),
+    };
+    let owner = match authenticate_owner(ctx, request.credentials()) {
+        Ok(owner) => owner,
+        Err(error) => return ControlFlow::Break(service_error(error)),
+    };
+    ControlFlow::Continue((request, owner))
+}
+
+/// What a route requires of the owner once the lifecycle lock is held.
+enum OwnerLifecycleGate<'a> {
+    /// `Status` reports inactivity as data rather than as an error, and `StartClash` is the
+    /// request that makes an owner active in the first place. Neither can demand one.
+    Unchecked,
+    /// Proof of being the active owner, which is all the read-only log routes need.
+    ActiveOwner,
+    /// Proof of the current session, not merely of the owner: a second instance of the same
+    /// user, or one whose core was replaced, must not reach the running core.
+    ActiveSession(&'a OwnerSessionProof),
+}
+
+/// Takes `OWNER_LIFECYCLE_LOCK` and then applies the route's gate, in that order — the gate
+/// reads the very state the lock protects.
+///
+/// The guard is returned rather than dropped here, so it lives for the whole of the caller's
+/// operation. On a rejected gate the response is built while the guard is still held, which is
+/// where it is built today.
+async fn enter_owner_lifecycle(
+    owner: &AuthenticatedOwner,
+    gate: OwnerLifecycleGate<'_>,
+) -> ControlFlow<Result<HttpResponse>, MutexGuard<'static, ()>> {
+    let lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+    let gated = match gate {
+        OwnerLifecycleGate::Unchecked => Ok(()),
+        OwnerLifecycleGate::ActiveOwner => require_active_owner(owner).await,
+        OwnerLifecycleGate::ActiveSession(proof) => {
+            require_active_session(owner, proof).await.map(|_| ())
+        }
+    };
+    match gated {
+        Ok(()) => ControlFlow::Continue(lifecycle_guard),
+        Err(error) => ControlFlow::Break(service_error(error)),
+    }
+}
+
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |ctx| async move {
@@ -589,18 +669,15 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedRequest<()>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+                ControlFlow::Continue(authenticated) => authenticated,
+                ControlFlow::Break(response) => return response,
             };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
             match service_status_snapshot(&owner).await {
                 Ok(status) => ok_json(status),
                 Err(error) => {
@@ -610,17 +687,11 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
             trace!("Received StartClash command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedRequest<StartClashRequest>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
-            };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedRequest<StartClashRequest>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
             let start_request = request.payload;
             if hash_session_token(&start_request.proposed_session_token).is_err() {
                 return bad_request("Invalid proposed owner session token");
@@ -632,7 +703,11 @@ fn create_ipc_router() -> Result<Router> {
             }
             #[cfg(feature = "test")]
             test_proxy_barrier_note_start_waiting();
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
             let previous_owner = match load_active_owner().await {
                 Ok(owner) => owner,
                 Err(error) => {
@@ -652,14 +727,7 @@ fn create_ipc_router() -> Result<Router> {
             };
             let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
                 Ok(result) => result,
-                Err(mut error) => {
-                    if let Err(cleanup_error) = transition.discard_unstarted_runtime().await {
-                        error.message.push_str(&format!(
-                            "; failed to discard unused runtime generation: {cleanup_error:#}"
-                        ));
-                    }
-                    return service_error(error);
-                }
+                Err(error) => return service_error(error),
             };
             if let Err(error) = cleanup_legacy_owner_files(&owner).await {
                 warn!(
@@ -676,40 +744,28 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedRequest<()>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+                ControlFlow::Continue(authenticated) => authenticated,
+                ControlFlow::Break(response) => return response,
             };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            if let Err(error) = require_active_owner(&owner).await {
-                return service_error(error);
-            }
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
             ok_json(LOGGER_MANAGER.get_logs().await)
         })
         .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
             trace!("Received GetClashLogSnapshot command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedRequest<()>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
+                ControlFlow::Continue(authenticated) => authenticated,
+                ControlFlow::Break(response) => return response,
             };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            if let Err(error) = require_active_owner(&owner).await {
-                return service_error(error);
-            }
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
             let path = service_paths()
                 .for_owner(&owner.identity)
                 .logs_dir()
@@ -723,21 +779,20 @@ fn create_ipc_router() -> Result<Router> {
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedSessionRequest<()>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            let _lifecycle_guard = match enter_owner_lifecycle(
+                &owner,
+                OwnerLifecycleGate::ActiveSession(&request.session),
+            )
+            .await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
             };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            if let Err(error) = require_active_session(&owner, &request.session).await {
-                return service_error(error);
-            }
             if let Err(error) = clear_proxy_with_direct_compensation().await {
                 return service_error(error);
             }
@@ -757,61 +812,85 @@ fn create_ipc_router() -> Result<Router> {
             }
             ok_empty("Core stopped successfully")
         })
+        .put(IpcCommand::StageRuntime.as_ref(), |ctx| async move {
+            trace!("Received StageRuntime command");
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<RuntimeBundle>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            // The guard is held for the whole operation, and for the same reason `StartClash`
+            // holds it: a core must not be stopped, started, or handed to another owner while its
+            // generation is being rewritten underneath it. Staging writes into the directory the
+            // *running* core reads from, which is why the gate is the session and not the owner.
+            let _lifecycle_guard = match enter_owner_lifecycle(
+                &owner,
+                OwnerLifecycleGate::ActiveSession(&request.session),
+            )
+            .await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            match stage_runtime(&owner, &request.payload).await {
+                Ok(outcome) => ok_json(outcome),
+                Err(error) => service_error(error),
+            }
+        })
         .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            match ctx.json::<AuthenticatedSessionRequest<WriterConfig>>() {
-                Ok(request) => {
-                    let owner = match authenticate_owner(&ctx, &request.credentials) {
-                        Ok(owner) => owner,
-                        Err(error) => return service_error(error),
-                    };
-                    let mut writer_config = request.payload;
-                    let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-                    if let Err(error) = require_active_session(&owner, &request.session).await {
-                        return service_error(error);
-                    }
-                    writer_config.directory = service_paths()
-                        .for_owner(&owner.identity)
-                        .logs_dir()
-                        .to_string_lossy()
-                        .into_owned();
-                    match set_or_update_writer(&writer_config).await {
-                        Ok(_) => info!("Update writer successfully"),
-                        Err(e) => {
-                            return service_unavailable(format!("Failed to update writer: {}", e));
-                        }
-                    };
-                    if let Err(e) = persist_owner_writer_config(&owner, &writer_config).await {
-                        return service_unavailable(format!(
-                            "Failed to persist writer config: {}",
-                            e
-                        ));
-                    }
-                    ok_empty("Update Writer successfully")
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<WriterConfig>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            let mut writer_config = request.payload;
+            let _lifecycle_guard = match enter_owner_lifecycle(
+                &owner,
+                OwnerLifecycleGate::ActiveSession(&request.session),
+            )
+            .await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
+            };
+            // The client does not get to choose where the service writes: whatever it sent is
+            // replaced with the owner's own log directory.
+            writer_config.directory = service_paths()
+                .for_owner(&owner.identity)
+                .logs_dir()
+                .to_string_lossy()
+                .into_owned();
+            match set_or_update_writer(&writer_config).await {
+                Ok(_) => info!("Update writer successfully"),
+                Err(e) => {
+                    return service_unavailable(format!("Failed to update writer: {}", e));
                 }
-                Err(error) => bad_request(format!("Invalid JSON: {error}")),
+            };
+            if let Err(e) = persist_owner_writer_config(&owner, &writer_config).await {
+                return service_unavailable(format!("Failed to persist writer config: {}", e));
             }
+            ok_empty("Update Writer successfully")
         })
         .put(IpcCommand::SetSystemProxy.as_ref(), |ctx| async move {
             trace!("Received SetSystemProxy command");
-            if let Err(error) = require_protocol_version(&ctx) {
-                return service_error(error);
-            }
-            let request = match ctx.json::<AuthenticatedSessionRequest<MacosProxyConfig>>() {
-                Ok(request) => request,
-                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<MacosProxyConfig>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            // The proxy config is still validated here, after the gate, and not alongside
+            // `StartClash`'s pre-lock validation: a stale session must keep winning over an
+            // invalid payload.
+            let _lifecycle_guard = match enter_owner_lifecycle(
+                &owner,
+                OwnerLifecycleGate::ActiveSession(&request.session),
+            )
+            .await
+            {
+                ControlFlow::Continue(guard) => guard,
+                ControlFlow::Break(response) => return response,
             };
-            let owner = match authenticate_owner(&ctx, &request.credentials) {
-                Ok(owner) => owner,
-                Err(error) => return service_error(error),
-            };
-            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            if let Err(error) = require_active_session(&owner, &request.session).await {
-                return service_error(error);
-            }
             if let Err(error) = validate_proxy_config(&request.payload) {
                 return service_error(ServiceError::invalid_proxy_config(error.to_string()));
             }
