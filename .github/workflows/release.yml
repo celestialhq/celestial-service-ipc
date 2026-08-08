@@ -135,6 +135,13 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
+          # Upstream signs with its own Apple certificate. This fork has none, and an
+          # unset secret made `security import` fail the whole release rather than
+          # producing unsigned binaries, which is what it should do here.
+          if [ -z "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "No Apple signing certificate configured; leaving the binaries unsigned."
+            exit 0
+          fi
           echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
           security create-keychain -p github-actions github-actions.keychain
           security default-keychain -s github-actions.keychain
@@ -150,7 +157,7 @@ jobs:
               --keychain github-actions.keychain \
               --options runtime \
               --timestamp \
-              --identifier "io.github.pius-pp.celestial-service-service-ipc" \
+              --identifier "io.github.pius-pp.celestial-service-ipc" \
               "target/${{ matrix.target }}/release/$bin"
             codesign -dvv "target/${{ matrix.target }}/release/$bin"
             codesign -d --entitlements /dev/stdout "target/${{ matrix.target }}/release/$bin"

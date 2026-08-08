@@ -8,7 +8,7 @@ pub use structure::{
     ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle,
     SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
     ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest,
-    StartClashResult, WriterConfig, owner_key,
+    StartClashResult, VersionReply, WriterConfig, owner_key,
 };
 
 pub mod paths;

@@ -71,6 +71,42 @@ impl ProtocolInfo {
     }
 }
 
+/// What a service answered when asked for its version.
+///
+/// Helpers built before the protocol handshake replied with a bare version string where a
+/// [`ProtocolInfo`] now goes. That reply is precisely the case the handshake exists to detect,
+/// so it has to *parse*: refusing it turns "this helper predates the handshake, reinstall it"
+/// into a serialization error the user cannot act on, and makes an old-but-reachable service
+/// indistinguishable from an unreachable one -- so the client retries it instead of offering
+/// the reinstall that would fix it.
+///
+/// Untagged, with the struct first: a JSON object cannot match `Legacy`, and a JSON string
+/// cannot match `Protocol`, so the two are unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VersionReply {
+    Protocol(ProtocolInfo),
+    Legacy(String),
+}
+
+impl VersionReply {
+    /// The protocol description, when the service was new enough to send one.
+    pub const fn protocol(&self) -> Option<&ProtocolInfo> {
+        match self {
+            Self::Protocol(info) => Some(info),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    /// The bare version string of a service that predates the handshake.
+    pub fn legacy_version(&self) -> Option<&str> {
+        match self {
+            Self::Protocol(_) => None,
+            Self::Legacy(version) => Some(version.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnerIdentity {
     Unix { uid: u32, gid: u32 },

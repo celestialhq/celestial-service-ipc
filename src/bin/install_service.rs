@@ -169,12 +169,16 @@ fn wait_for_service_ready() -> Result<(), Error> {
         let result = loop {
             if let Ok(response) = celestial_service_ipc::get_version().await
                 && response.code == 0
-                && response.data.is_some_and(|info| {
-                    info.supports_client(
-                        celestial_service_ipc::ProtocolVersion::current(),
-                        celestial_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
-                    )
-                })
+                && response
+                    .data
+                    .as_ref()
+                    .and_then(celestial_service_ipc::VersionReply::protocol)
+                    .is_some_and(|info| {
+                        info.supports_client(
+                            celestial_service_ipc::ProtocolVersion::current(),
+                            celestial_service_ipc::MIN_REQUIRED_SERVICE_REVISION,
+                        )
+                    })
             {
                 break Ok(());
             }
